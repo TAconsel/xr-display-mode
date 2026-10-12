@@ -1,0 +1,3 @@
+# XREAL glasses: let the logged-in user talk to the glasses' HID interfaces
+# (display mode and brightness on the MCU interface).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", MODE="0660", TAG+="uaccess"

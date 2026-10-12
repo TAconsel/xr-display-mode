@@ -1,0 +1,480 @@
+#!/usr/bin/python3 -I
+"""XR Display Mode: switch XREAL glasses between 2D and side-by-side 3D.
+
+The glasses' MCU HID interface takes 64-byte reports:
+    0xfd | crc32 (4) | length (2) | timestamp (8) | msgid (2) | reserved (5) | data
+length counts itself through the end of data; crc32 covers those `length` bytes.
+Replies echo the msgid and start data with a status byte (0 = ok).
+
+Without arguments this opens the GTK window. For scripts and shortcuts:
+    xr-display-mode --list | --get | --set sbs|2d|<mode number>
+    xr-display-mode --brightness [0-8]
+"""
+
+import os
+import select
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+import json
+
+XREAL_VENDOR = 0x3318
+MSG_GET_BRIGHTNESS = 0x03
+MSG_SET_BRIGHTNESS = 0x04
+MSG_GET_DISPLAY_MODE = 0x07
+MSG_SET_DISPLAY_MODE = 0x08
+MSG_GET_SERIAL = 0x15
+MSG_GET_FIRMWARE = 0x26
+
+# (mode, title, subtitle, is_3d). Tested on an Air 2 (firmware 09.1.00.107):
+# mode 10 is rejected there; mode 1 lets the computer pick 60, 90 or 120 Hz.
+MODES = [
+    (1, "2D", "1920×1080 · computer picks 60, 90 or 120 Hz", False),
+    (5, "2D 72 Hz", "1920×1080 at 72 Hz", False),
+    (10, "2D 90 Hz", "1920×1080 at 90 Hz · not accepted by every firmware", False),
+    (11, "2D 120 Hz", "1920×1080 at 120 Hz", False),
+    (3, "SBS 3D 60 Hz", "3840×1080 · full 1920×1080 per eye", True),
+    (4, "SBS 3D 72 Hz", "3840×1080 · full 1920×1080 per eye", True),
+    (9, "SBS 3D 90 Hz", "3840×1080 · full 1920×1080 per eye", True),
+    (8, "Half SBS 3D 60 Hz", "1920×1080 · 960×1080 per eye, stretched", True),
+]
+MODE_NAMES = {m[0]: m[1] for m in MODES}
+# Brightness levels, same steps as the buttons on the glasses (higher values clamp to 8).
+MAX_BRIGHTNESS = 8
+SBS_DEFAULT = 3
+FLAT_DEFAULT = 1
+
+
+class McuError(Exception):
+    pass
+
+
+def find_mcu():
+    """Returns (hidraw path, product name) for the glasses' MCU interface, or None."""
+    for node in sorted(os.listdir("/sys/class/hidraw")):
+        try:
+            device = os.path.realpath(f"/sys/class/hidraw/{node}/device")
+            with open(os.path.join(device, "uevent")) as f:
+                uevent = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+            _bus, vendor, product = (int(x, 16) for x in uevent["HID_ID"].split(":"))
+        except (OSError, KeyError, ValueError):
+            continue
+        if vendor != XREAL_VENDOR:
+            continue
+        # MCU is interface 4 on Air / Air 2 / Air 2 Pro and 0 on Air 2 Ultra (0x0426).
+        interface = 0 if product == 0x0426 else 4
+        usb_interface = os.path.basename(os.path.dirname(device))  # e.g. 3-1:1.4
+        if usb_interface.rsplit(".", 1)[-1] == str(interface):
+            return f"/dev/{node}", uevent.get("HID_NAME", "XREAL glasses")
+    return None
+
+
+class Mcu:
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.lock = threading.Lock()
+
+    def close(self):
+        os.close(self.fd)
+
+    def command(self, msgid, data=b"", timeout=1.5):
+        """Sends one request and returns the reply data after its status byte."""
+        body = struct.pack("<HQH5s", 17 + len(data), 0, msgid, bytes(5)) + data
+        packet = (b"\xfd" + struct.pack("<I", zlib.crc32(body)) + body).ljust(64, b"\0")
+        with self.lock:
+            # Drop queued unsolicited reports (button and status events).
+            while select.select([self.fd], [], [], 0)[0]:
+                os.read(self.fd, 64)
+            os.write(self.fd, packet)
+            deadline = time.monotonic() + timeout
+            while (left := deadline - time.monotonic()) > 0:
+                if not select.select([self.fd], [], [], left)[0]:
+                    break
+                reply = os.read(self.fd, 64)
+                if len(reply) < 23 or reply[0] != 0xFD:
+                    continue
+                length, = struct.unpack_from("<H", reply, 5)
+                if struct.unpack_from("<H", reply, 15)[0] != msgid:
+                    continue
+                status = reply[22]
+                if status != 0:
+                    raise McuError(f"glasses replied with status {status}")
+                return reply[23:5 + length]
+        raise McuError("no reply from the glasses")
+
+    def text(self, msgid):
+        return self.command(msgid).split(b"\0", 1)[0].decode(errors="replace")
+
+    def brightness(self):
+        return self.command(MSG_GET_BRIGHTNESS)[0]
+
+    def set_brightness(self, level):
+        self.command(MSG_SET_BRIGHTNESS, bytes([max(0, min(MAX_BRIGHTNESS, level))]))
+
+    def display_mode(self):
+        return self.command(MSG_GET_DISPLAY_MODE)[0]
+
+    def set_display_mode(self, mode):
+        self.command(MSG_SET_DISPLAY_MODE, bytes([mode]))
+
+
+def find_connector():
+    """DRM connector name (e.g. DP-2) of the connected glasses, from the EDID."""
+    for entry in sorted(os.listdir("/sys/class/drm")):
+        base = f"/sys/class/drm/{entry}"
+        try:
+            with open(f"{base}/status") as f:
+                if f.read().strip() != "connected":
+                    continue
+            with open(f"{base}/edid", "rb") as f:
+                edid = f.read()
+        except OSError:
+            continue
+        if len(edid) < 128:
+            continue
+        code = (edid[8] << 8) | edid[9]
+        vendor = "".join(chr(((code >> s) & 31) + 64) for s in (10, 5, 0))
+        names = [edid[i + 5:i + 18].split(b"\n")[0].decode(errors="replace")
+                 for i in range(54, 126, 18) if edid[i:i + 4] == b"\0\0\0\xfc"]
+        if vendor == "MRG" or any(n.startswith(("Air", "XREAL")) for n in names):
+            return entry.split("-", 1)[1]
+    return None
+
+
+def output_modes(connector):
+    """(current mode id, [(id, name)]) of the connector according to KScreen."""
+    out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=10)
+    for output in json.loads(out.stdout)["outputs"]:
+        if output["name"] == connector:
+            modes = sorted(output["modes"], key=lambda m: (-m["size"]["width"], -m["refreshRate"]))
+            return output["currentModeId"], [(m["id"], m["name"]) for m in modes]
+    return None, []
+
+
+def run_cli(args):
+    found = find_mcu()
+    if not found:
+        sys.exit("xr-display-mode: no XREAL glasses found")
+    mcu = Mcu(found[0])
+    current = mcu.display_mode()
+    if args[0] == "--list":
+        for mode, title, subtitle, _ in MODES:
+            print(f"{'*' if mode == current else ' '} {mode:2}  {title:18} {subtitle}")
+    elif args[0] == "--get":
+        print(current, MODE_NAMES.get(current, "unknown"))
+    elif args[0] == "--set" and len(args) == 2:
+        mode = {"sbs": SBS_DEFAULT, "3d": SBS_DEFAULT, "2d": FLAT_DEFAULT}.get(args[1].lower())
+        mode = mode if mode is not None else int(args[1])
+        mcu.set_display_mode(mode)
+        print("set", mode, MODE_NAMES.get(mode, ""))
+    elif args[0] == "--brightness" and len(args) <= 2:
+        if len(args) == 2:
+            mcu.set_brightness(int(args[1]))
+        print(f"brightness {mcu.brightness()}/{MAX_BRIGHTNESS}")
+    else:
+        sys.exit(__doc__)
+
+
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, GLib, Gtk
+
+    def in_thread(work, done):
+        """Runs work() off the UI thread and hands (result, error) to done() on it."""
+        def run():
+            try:
+                result, error = work(), None
+            except Exception as e:  # noqa: BLE001 - reported in the UI
+                result, error = None, e
+            GLib.idle_add(lambda: done(result, error) and False)
+        threading.Thread(target=run, daemon=True).start()
+
+    class Window(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="XR Display Mode", default_width=480,
+                             default_height=860)
+            self.mcu = None
+            self.busy = False
+            self.updating = False
+            self.mode_checks = {}
+            self.connector = None
+            self.output_mode_ids = []
+            self.brightness_writing = False
+            self.brightness_touched = 0.0
+
+            self.toasts = Adw.ToastOverlay()
+            view = Adw.ToolbarView()
+            header = Adw.HeaderBar()
+            refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
+            refresh.connect("clicked", lambda _b: self.refresh(full=True))
+            header.pack_start(refresh)
+            self.spinner = Adw.Spinner(visible=False)
+            header.pack_end(self.spinner)
+            view.add_top_bar(header)
+            self.toasts.set_child(view)
+            self.set_content(self.toasts)
+
+            page = Adw.PreferencesPage()
+            view.set_content(page)
+
+            # Device and quick 2D / 3D switch.
+            device = Adw.PreferencesGroup()
+            page.add(device)
+            self.status = Adw.ActionRow(title="Looking for glasses…")
+            self.status.add_prefix(Gtk.Image(icon_name="video-display-symbolic", pixel_size=32))
+            device.add(self.status)
+            self.quick = Adw.ToggleGroup(homogeneous=True, margin_top=12)
+            self.quick.add(Adw.Toggle(name="2d", label="2D"))
+            self.quick.add(Adw.Toggle(name="3d", label="3D Side-by-side"))
+            self.quick.connect("notify::active-name", self.on_quick)
+            device.add(self.quick)
+
+            # Brightness, also changed by the buttons on the glasses (picked up by the poll).
+            light = Adw.PreferencesGroup()
+            page.add(light)
+            self.brightness_row = Adw.ActionRow(title="Brightness")
+            self.brightness_scale = Gtk.Scale.new_with_range(
+                Gtk.Orientation.HORIZONTAL, 0, MAX_BRIGHTNESS, 1)
+            self.brightness_scale.set_size_request(260, -1)
+            self.brightness_scale.set_draw_value(False)
+            self.brightness_scale.set_round_digits(0)
+            for level in range(MAX_BRIGHTNESS + 1):
+                self.brightness_scale.add_mark(level, Gtk.PositionType.BOTTOM, None)
+            self.brightness_scale.connect("value-changed", self.on_brightness_changed)
+            self.brightness_row.add_prefix(Gtk.Image(icon_name="display-brightness-symbolic"))
+            self.brightness_row.add_suffix(self.brightness_scale)
+            light.add(self.brightness_row)
+
+            # Every mode of the glasses.
+            group = None
+            radio = None
+            for mode, title, subtitle, is_3d in MODES:
+                if group is None or (is_3d and group.get_title() == "2D Modes"):
+                    group = Adw.PreferencesGroup(
+                        title="3D Modes" if is_3d else "2D Modes",
+                        description="Glasses split the picture into a left and a right eye"
+                        if is_3d else "Same picture in both eyes")
+                    page.add(group)
+                check = Gtk.CheckButton(group=radio)
+                radio = radio or check
+                check.connect("toggled", self.on_mode_toggled, mode)
+                row = Adw.ActionRow(title=title, subtitle=f"Mode {mode} · {subtitle}")
+                row.add_prefix(check)
+                row.set_activatable_widget(check)
+                group.add(row)
+                self.mode_checks[mode] = check
+            # Hidden member so no mode shows as selected when the current one is unknown.
+            self.no_mode = Gtk.CheckButton(group=radio)
+
+            # Resolution and refresh rate the computer drives the glasses at.
+            self.output_group = Adw.PreferencesGroup(
+                title="Computer Output",
+                description="Video modes the glasses offer in the current mode")
+            page.add(self.output_group)
+            self.output_row = Adw.ComboRow(title="Resolution and refresh rate")
+            self.output_row.connect("notify::selected", self.on_output_selected)
+            self.output_group.add(self.output_row)
+
+            self.set_sensitive_controls(False)
+            # Keep the page at the top instead of scrolling to the focused radio.
+            self.connect("map", lambda _w: self.set_focus(None))
+            self.refresh(full=True)
+            GLib.timeout_add_seconds(2, self.poll)
+
+        def toast(self, text):
+            self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
+
+        def set_busy(self, busy):
+            self.busy = busy
+            self.spinner.set_visible(busy)
+            self.set_sensitive_controls(not busy and self.mcu is not None)
+
+        def set_sensitive_controls(self, sensitive):
+            self.quick.set_sensitive(sensitive)
+            self.brightness_row.set_sensitive(self.mcu is not None)
+            for check in self.mode_checks.values():
+                check.get_ancestor(Adw.ActionRow).set_sensitive(sensitive)
+            self.output_row.set_sensitive(sensitive and bool(self.output_mode_ids))
+
+        def poll(self):
+            if not self.busy:
+                self.refresh(full=self.mcu is None)
+            return True
+
+        def refresh(self, full=False):
+            """Re-reads the glasses (full: re-detect and read serial and firmware too)."""
+            if self.busy:
+                return
+            self.busy = True
+            mcu = self.mcu
+
+            def work():
+                nonlocal mcu
+                info = {}
+                if full or mcu is None:
+                    found = find_mcu()
+                    if mcu is not None:
+                        mcu.close()
+                        mcu = None
+                    if not found:
+                        return None, info
+                    mcu = Mcu(found[0])
+                    info = {"name": found[1], "serial": mcu.text(MSG_GET_SERIAL),
+                            "firmware": mcu.text(MSG_GET_FIRMWARE)}
+                info["mode"] = mcu.display_mode()
+                info["brightness"] = mcu.brightness()
+                info["connector"] = find_connector()
+                if info["connector"]:
+                    info["output"] = output_modes(info["connector"])
+                return mcu, info
+
+            def done(result, error):
+                self.busy = False
+                if error is not None:
+                    # Glasses unplugged mid-read, or the node went away.
+                    if self.mcu is not None:
+                        self.mcu.close()
+                    self.mcu = None
+                    self.show_absent(str(error))
+                    return
+                self.mcu, info = result
+                if self.mcu is None:
+                    self.show_absent()
+                else:
+                    self.show_state(info)
+
+            in_thread(work, done)
+
+        def show_absent(self, reason=None):
+            self.status.set_title("No XREAL glasses connected")
+            self.status.set_subtitle(reason or "Plug in the glasses over USB-C.")
+            self.output_mode_ids = []
+            self.set_sensitive_controls(False)
+
+        def show_state(self, info):
+            if "name" in info:
+                self.status.set_title(info["name"])
+                self.status.set_subtitle(
+                    f"Serial {info['serial']} · firmware {info['firmware']}")
+            mode = info["mode"]
+            self.updating = True
+            self.mode_checks.get(mode, self.no_mode).set_active(True)
+            is_3d = next((m[3] for m in MODES if m[0] == mode), False)
+            self.quick.set_active_name("3d" if is_3d else "2d")
+            # Don't fight the slider while the user is moving it.
+            if not self.brightness_writing and time.monotonic() - self.brightness_touched > 1.5:
+                self.brightness_scale.set_value(info["brightness"])
+            self.brightness_row.set_subtitle(f"{info['brightness']} of {MAX_BRIGHTNESS}")
+            self.connector = info.get("connector")
+            current, modes = info.get("output", (None, []))
+            ids = [m[0] for m in modes]
+            if ids != self.output_mode_ids:
+                self.output_mode_ids = ids
+                self.output_row.set_model(Gtk.StringList.new([m[1] for m in modes]))
+            if current in ids:
+                self.output_row.set_selected(ids.index(current))
+            self.output_group.set_title(
+                f"Computer Output ({self.connector})" if self.connector else "Computer Output")
+            self.updating = False
+            self.set_sensitive_controls(True)
+
+        def on_quick(self, group, _pspec):
+            if self.updating or self.mcu is None:
+                return
+            want_3d = group.get_active_name() == "3d"
+            current = next((m for m in MODES if self.mode_checks[m[0]].get_active()), None)
+            if current is not None and current[3] == want_3d:
+                return
+            self.apply_mode(SBS_DEFAULT if want_3d else FLAT_DEFAULT)
+
+        def on_brightness_changed(self, scale):
+            if self.updating or self.mcu is None:
+                return
+            self.brightness_touched = time.monotonic()
+            if not self.brightness_writing:
+                self.write_brightness()
+
+        def write_brightness(self):
+            """Sends the slider value; while one write is in flight, later moves coalesce."""
+            level = round(self.brightness_scale.get_value())
+            self.brightness_writing = True
+            mcu = self.mcu
+
+            def done(_result, error):
+                self.brightness_writing = False
+                if error is not None:
+                    self.toast(f"Brightness: {error}")
+                elif self.mcu is not None and round(self.brightness_scale.get_value()) != level:
+                    self.write_brightness()
+                else:
+                    self.brightness_row.set_subtitle(f"{level} of {MAX_BRIGHTNESS}")
+
+            in_thread(lambda: mcu.set_brightness(level), done)
+
+        def on_mode_toggled(self, check, mode):
+            if not self.updating and check.get_active() and self.mcu is not None:
+                self.apply_mode(mode)
+
+        def apply_mode(self, mode):
+            if self.busy:
+                return
+            self.set_busy(True)
+            mcu = self.mcu
+
+            def work():
+                mcu.set_display_mode(mode)
+                # The glasses re-train the DisplayPort link; give the compositor time.
+                time.sleep(3)
+
+            def done(_result, error):
+                self.set_busy(False)
+                if error is not None:
+                    self.toast(f"{MODE_NAMES.get(mode, mode)}: {error}")
+                else:
+                    self.toast(f"Switched to {MODE_NAMES.get(mode, mode)}")
+                self.refresh()
+
+            in_thread(work, done)
+
+        def on_output_selected(self, row, _pspec):
+            index = row.get_selected()
+            if self.updating or self.busy or not self.connector or index >= len(self.output_mode_ids):
+                return
+            mode_id = self.output_mode_ids[index]
+            name = row.get_model().get_string(index)
+            self.set_busy(True)
+            connector = self.connector
+
+            def work():
+                out = subprocess.run(["kscreen-doctor", f"output.{connector}.mode.{mode_id}"],
+                                     capture_output=True, text=True, timeout=15)
+                if out.returncode != 0:
+                    raise RuntimeError(out.stderr.strip() or "kscreen-doctor failed")
+                time.sleep(1)
+
+            def done(_result, error):
+                self.set_busy(False)
+                self.toast(f"Output mode: {error}" if error else f"Output set to {name}")
+                self.refresh()
+
+            in_thread(work, done)
+
+    app = Adw.Application(application_id="io.github.taconsel.XrDisplayMode")
+    app.connect("activate", lambda a: (a.get_active_window() or Window(a)).present())
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        try:
+            run_cli(sys.argv[1:])
+        except (McuError, OSError, ValueError) as e:
+            sys.exit(f"xr-display-mode: {e}")
+    else:
+        sys.exit(run_gui())

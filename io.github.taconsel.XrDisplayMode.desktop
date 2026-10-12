@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=XR Display Mode
+GenericName=XREAL Glasses Display Mode
+Comment=Switch XREAL glasses between 2D and side-by-side 3D
+Exec=xr-display-mode
+Icon=video-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=XREAL;VR;AR;3D;SBS;stereo;glasses;
+StartupNotify=true
